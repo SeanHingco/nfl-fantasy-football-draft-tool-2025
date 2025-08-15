@@ -373,7 +373,7 @@ def recommend_players(
     *,
     starter_requirements: Dict[str, int],
     candidate_pool_size: int = 15,
-    num_simulations: int = 100,
+    num_simulations: int = 50,
     weight_adp: float = -0.1,
     opponent_top_n: int = 5,
     user_strategy_weight_adp: float = -0.1,
