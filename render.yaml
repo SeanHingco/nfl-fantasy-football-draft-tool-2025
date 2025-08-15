@@ -5,6 +5,8 @@ services:
     plan: free
     rootDir: .
     dockerfilePath: server/Dockerfile
+    buildCommand: docker build . -f proj-ui/Dockerfile \
+      --build-arg VITE_API_BASE=https://fantasy-api-p6ox.onrender.com
     autoDeploy: true
 
   - type: web
