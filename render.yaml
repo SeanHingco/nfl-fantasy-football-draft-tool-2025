@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: fantasy-api
+    env: docker
+    plan: free
+    rootDir: .
+    dockerfilePath: server/Dockerfile
+    autoDeploy: true
+
+  - type: web
+    name: fantasy-ui
+    env: docker
+    plan: free
+    rootDir: .
+    dockerfilePath: proj-ui/Dockerfile
+    autoDeploy: true
