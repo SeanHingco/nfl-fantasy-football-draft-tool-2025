@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./server
+    container_name: backend
+    ports:
+      - "8000:8000"
+    environment:
+      - CORS_ORIGIN=http://localhost:5173,http://localhost:8080
+    volumes:
+      - ./data:/app/data
+  
+  frontend:
+    build:
+      context: ./proj-ui
+      args:
+        - VITE_API_URL=http://localhost:8000=value
+    container_name: frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
