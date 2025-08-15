@@ -434,6 +434,7 @@ def recommend_players(
         player was drafted.
     """
     import random
+    import time
     # Identify the index of the user's next pick
     user_team_idx = draft_state.user_team_index
     # Find next pick index for user in the original state
@@ -528,6 +529,7 @@ def recommend_players(
     results: List[tuple[Player, float]] = []
 
     # For each candidate, run simulations
+    start = time.time()
     for candidate in candidate_players:
         total_value = 0.0
         successful_runs = 0
@@ -640,6 +642,7 @@ def recommend_players(
             fills_slot=fills_slot,
             rationale=rationale
         ))
+    print("Simulation time:", time.time() - start)
     # Sort results by expected value descending
     results.sort(key=lambda r: (r.ev_unconditional, r.ev_if_available, r.vor), reverse=True)
     return results
