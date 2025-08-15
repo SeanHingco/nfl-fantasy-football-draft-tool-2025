@@ -13,8 +13,8 @@ RUN npm install ci
 
 # Allow overriding API URL at build time:
 # docker build --build-arg VITE_API_URL=http://localhost:8000
-ARG VITE_API_URL
-ENV VITE_API_URL=${VITE_API_URL}
+ARG VITE_API_BASE
+ENV VITE_API_BASE=${VITE_API_BASE}
 RUN npm run build
 
 # --- Run Stage ---
