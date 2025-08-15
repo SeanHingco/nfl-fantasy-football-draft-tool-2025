@@ -7,7 +7,7 @@ app = FastAPI(title="Fantasy Draft Recommender", version="0.1.0")
 # allow your Vite dev server (default: http://localhost:5173)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:8080", "http://localhost:5173"],
+    allow_origins=["http://127.0.0.1:5173", "http://localhost:8080", "http://localhost:5173", "https://fantasy-ui.onrender.com"],
     allow_credentials=False,
     allow_methods=["*"],   # lets the preflight say POST is allowed
     allow_headers=["*"],   # lets the preflight say your headers are allowed
