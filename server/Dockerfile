@@ -11,11 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-COPY requirements.txt /app/
+COPY server/requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
-COPY . /app/
+COPY server/ /app
+COPY data/ /data
 
 # Expose API port
 EXPOSE 8000

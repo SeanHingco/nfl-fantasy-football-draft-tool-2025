@@ -3,12 +3,12 @@
 # --- Build Stage ---
 FROM node:20-alpine AS build
 WORKDIR /app
-COPY package*.json ./
-COPY tsconfig*.json ./
-COPY src ./src
-COPY vite.config.ts ./
-COPY index.html ./
-COPY public ./public
+COPY server/package*.json ./
+COPY server/tsconfig*.json ./
+COPY server/src ./src
+COPY server/vite.config.ts ./
+COPY server/index.html ./
+COPY server/public ./public
 RUN npm install ci
 
 # Allow overriding API URL at build time:
