@@ -1,7 +1,7 @@
 # server/app.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-import os, logging
+import os, logging, uuid, time
 
 app = FastAPI(title="Fantasy Draft Recommender", version="0.1.0")
 logger = logging.getLogger("uvicorn.error")
@@ -15,6 +15,21 @@ app.add_middleware(
     allow_methods=["*"],   # lets the preflight say POST is allowed
     allow_headers=["*"],   # lets the preflight say your headers are allowed
 )
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    rid = str(uuid.uuid4())[:8]
+    start = time.perf_counter()
+    try:
+        # read body once (small payload), to log session_id/num_simulations if present
+        body = await request.body()
+        logger.info("REQ %s %s %s body=%s", rid, request.method, request.url.path, body[:300])
+        response = await call_next(request)
+        return response
+    finally:
+        dur = time.perf_counter() - start
+        logger.info("RES %s %s %.2fs %s", rid, request.url.path, dur, getattr(response, "status_code", "?"))
 
 # server/app.py
 from fastapi import FastAPI, HTTPException
