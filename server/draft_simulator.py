@@ -18,7 +18,142 @@ from typing import Callable, Dict, List, Optional, Sequence
 from draft_models import Player, TeamRoster, Recommendation
 from draft_state import DraftState
 from collections import defaultdict
-from typing import Optional, Dict, List, Sequence, Tuple
+from typing import Optional, Dict, List, Sequence, Tuple, Any
+import os, math
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+SIM_WORKERS = int(os.getenv("SIM_WORKERS", str(os.cpu_count() or 1)))
+
+def _simulate_candidate_once(
+    draft_state,
+    candidate,
+    user_team_idx: int,
+    starter_requirements: Dict[str, int],
+    replacement_levels,
+    user_strategy_weight_adp: float,
+    user_strategy_top_n: int,
+    opponent_top_n: int,
+    allow_flex_early: bool,
+    flex_threshold: float,
+    allow_bench_early: bool,
+    bench_threshold: float,
+):
+    """
+    One simulation for a single candidate.
+    Returns (success: bool, value_if_success: float).
+    """
+    import random
+
+    # utils available in your file:
+    # copy_draft_state, compute_flex_decision, compute_bench_decision,
+    # score_players, select_player_for_team, evaluate_team_value
+
+    sim_state = copy_draft_state(draft_state)
+    forced_candidate = False
+
+    def same(a, b):
+        return (a.name, a.team, a.position) == (b.name, b.team, b.position)
+
+    while not sim_state.is_draft_over():
+        team_idx = sim_state.get_current_team_index()
+
+        if team_idx == user_team_idx:
+            if not forced_candidate:
+                cand_sim = next((p for p in sim_state.available_players if same(p, candidate)), None)
+                if cand_sim is not None and sim_state.teams[user_team_idx].can_draft(cand_sim):
+                    sim_state.make_pick(user_team_idx, cand_sim)
+                    forced_candidate = True
+                else:
+                    sim_state.advance_pick()
+                    break  # candidate unavailable -> unsuccessful run
+            else:
+                eligible = [p for p in sim_state.available_players
+                            if sim_state.teams[user_team_idx].can_draft(p)]
+                if eligible:
+                    # Decide gates
+                    flex_now, is_flex_only = compute_flex_decision(
+                        sim_state.teams[user_team_idx],
+                        eligible,
+                        starter_requirements,
+                        replacement_levels,
+                        allow_flex_early=allow_flex_early,
+                        flex_threshold=flex_threshold,
+                    )
+                    bench_now, is_bench_only = compute_bench_decision(
+                        sim_state.teams[user_team_idx],
+                        eligible,
+                        starter_requirements,
+                        replacement_levels,
+                        allow_bench_early=allow_bench_early,
+                        bench_threshold=bench_threshold,
+                    )
+
+                    # Base score (ADP blend)
+                    scores = score_players(eligible, weight_adp=user_strategy_weight_adp)
+
+                    # Apply nudges/penalties
+                    for p in eligible:
+                        if is_flex_only.get(p, False):
+                            scores[p] += 0.25 if flex_now else -1e6
+                        if is_bench_only.get(p, False):
+                            scores[p] += 0.25 if bench_now else -1e6
+
+                    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                    top_pool = [p for p, _ in ranked[:user_strategy_top_n]
+                                if sim_state.teams[user_team_idx].can_draft(p)]
+                    if top_pool:
+                        sim_state.make_pick(user_team_idx, random.choice(top_pool))
+            sim_state.advance_pick()
+        else:
+            opp_player = select_player_for_team(sim_state, team_idx, top_n=opponent_top_n)
+            if opp_player:
+                sim_state.make_pick(team_idx, opp_player)
+            sim_state.advance_pick()
+
+    if not forced_candidate:
+        return False, 0.0
+
+    value = evaluate_team_value(sim_state.teams[user_team_idx], starter_requirements)
+    return True, float(value)
+
+
+def evaluate_candidate_batch(
+    draft_state,
+    candidate,
+    *,
+    num_simulations: int,
+    user_team_idx: int,
+    starter_requirements: Dict[str, int],
+    replacement_levels,
+    user_strategy_weight_adp: float,
+    user_strategy_top_n: int,
+    opponent_top_n: int,
+    allow_flex_early: bool,
+    flex_threshold: float,
+    allow_bench_early: bool,
+    bench_threshold: float,
+) -> Dict[str, Any]:
+    """
+    Runs `num_simulations` for one candidate and returns mergeable aggregates.
+    """
+    total_value = 0.0
+    successful_runs = 0
+
+    for _ in range(num_simulations):
+        ok, val = _simulate_candidate_once(
+            draft_state, candidate, user_team_idx, starter_requirements, replacement_levels,
+            user_strategy_weight_adp, user_strategy_top_n, opponent_top_n,
+            allow_flex_early, flex_threshold, allow_bench_early, bench_threshold,
+        )
+        if ok:
+            total_value += val
+            successful_runs += 1
+
+    return {
+        "total_value": total_value,
+        "successful_runs": successful_runs,
+        "num_simulations": num_simulations,
+    }
 
 
 def evaluate_team_value(team: TeamRoster, starter_requirements: Dict[str, int]) -> float:
@@ -530,118 +665,191 @@ def recommend_players(
 
     # For each candidate, run simulations
     start = time.time()
-    for candidate in candidate_players:
-        total_value = 0.0
-        successful_runs = 0
-        for _ in range(num_simulations):
-            # Copy state for simulation
-            sim_state = copy_draft_state(draft_state)
-            # Simulate draft from current pick to end
-            forced_candidate = False
-            def same(a,b): return (a.name,a.team,a.position)==(b.name,b.team,b.position)
+    # for candidate in candidate_players:
+    #     total_value = 0.0
+    #     successful_runs = 0
+    #     for _ in range(num_simulations):
+    #         # Copy state for simulation
+    #         sim_state = copy_draft_state(draft_state)
+    #         # Simulate draft from current pick to end
+    #         forced_candidate = False
+    #         def same(a,b): return (a.name,a.team,a.position)==(b.name,b.team,b.position)
 
-            while not sim_state.is_draft_over():
-                team_idx = sim_state.get_current_team_index()
+    #         while not sim_state.is_draft_over():
+    #             team_idx = sim_state.get_current_team_index()
 
-                if team_idx == user_team_idx:
-                    if not forced_candidate:
-                        # find this candidate's object in the sim copy
-                        cand_sim = next((p for p in sim_state.available_players if same(p, candidate)), None)
-                        if cand_sim is not None and sim_state.teams[user_team_idx].can_draft(cand_sim):
-                            sim_state.make_pick(user_team_idx, cand_sim)
-                            forced_candidate = True
-                        else:
-                            # candidate unavailable in this run -> bail early (no success counted)
-                            sim_state.advance_pick()
-                            break
-                    else:
-                        # later user picks with FLEX + BENCH gates
-                        eligible = [p for p in sim_state.available_players
-                                    if sim_state.teams[user_team_idx].can_draft(p)]
-                        if eligible:
-                            # Decide gates
-                            flex_now, is_flex_only = compute_flex_decision(
-                                sim_state.teams[user_team_idx],
-                                eligible,
-                                starter_requirements,
-                                replacement_levels,
-                                allow_flex_early=allow_flex_early,
-                                flex_threshold=flex_threshold,
-                            )
-                            bench_now, is_bench_only = compute_bench_decision(
-                                sim_state.teams[user_team_idx],
-                                eligible,
-                                starter_requirements,
-                                replacement_levels,
-                                allow_bench_early=allow_bench_early,
-                                bench_threshold=bench_threshold,
-                            )
+    #             if team_idx == user_team_idx:
+    #                 if not forced_candidate:
+    #                     # find this candidate's object in the sim copy
+    #                     cand_sim = next((p for p in sim_state.available_players if same(p, candidate)), None)
+    #                     if cand_sim is not None and sim_state.teams[user_team_idx].can_draft(cand_sim):
+    #                         sim_state.make_pick(user_team_idx, cand_sim)
+    #                         forced_candidate = True
+    #                     else:
+    #                         # candidate unavailable in this run -> bail early (no success counted)
+    #                         sim_state.advance_pick()
+    #                         break
+    #                 else:
+    #                     # later user picks with FLEX + BENCH gates
+    #                     eligible = [p for p in sim_state.available_players
+    #                                 if sim_state.teams[user_team_idx].can_draft(p)]
+    #                     if eligible:
+    #                         # Decide gates
+    #                         flex_now, is_flex_only = compute_flex_decision(
+    #                             sim_state.teams[user_team_idx],
+    #                             eligible,
+    #                             starter_requirements,
+    #                             replacement_levels,
+    #                             allow_flex_early=allow_flex_early,
+    #                             flex_threshold=flex_threshold,
+    #                         )
+    #                         bench_now, is_bench_only = compute_bench_decision(
+    #                             sim_state.teams[user_team_idx],
+    #                             eligible,
+    #                             starter_requirements,
+    #                             replacement_levels,
+    #                             allow_bench_early=allow_bench_early,
+    #                             bench_threshold=bench_threshold,
+    #                         )
 
-                            # Base score (ADP blend)
-                            scores = score_players(eligible, weight_adp=user_strategy_weight_adp)
+    #                         # Base score (ADP blend)
+    #                         scores = score_players(eligible, weight_adp=user_strategy_weight_adp)
 
-                            # Apply nudges/penalties
-                            for p in eligible:
-                                # FLEX-only
-                                if is_flex_only.get(p, False):
-                                    scores[p] += 0.25 if flex_now else -1e6  # tune the penalty if you want softer behavior
-                                # BENCH-only
-                                if is_bench_only.get(p, False):
-                                    scores[p] += 0.25 if bench_now else -1e6
+    #                         # Apply nudges/penalties
+    #                         for p in eligible:
+    #                             # FLEX-only
+    #                             if is_flex_only.get(p, False):
+    #                                 scores[p] += 0.25 if flex_now else -1e6  # tune the penalty if you want softer behavior
+    #                             # BENCH-only
+    #                             if is_bench_only.get(p, False):
+    #                                 scores[p] += 0.25 if bench_now else -1e6
 
-                            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-                            top_pool = [p for p, _ in ranked[:user_strategy_top_n] if sim_state.teams[user_team_idx].can_draft(p)]
-                            if top_pool:
-                                sim_state.make_pick(user_team_idx, random.choice(top_pool))
-                    sim_state.advance_pick()
-                else:
-                    opp_player = select_player_for_team(sim_state, team_idx, top_n=opponent_top_n)
-                    if opp_player:
-                        sim_state.make_pick(team_idx, opp_player)
-                    sim_state.advance_pick()
-            # After full draft (or break), evaluate if candidate was drafted
-            if forced_candidate:
-                value = evaluate_team_value(sim_state.teams[user_team_idx], starter_requirements)
-                total_value += value
-                successful_runs += 1
-        # Calculate expected value across simulations (averaging over all runs)
-        avg_value = (total_value / successful_runs) if successful_runs > 0 else 0.0
-        p_available = successful_runs / num_simulations if num_simulations > 0 else 0.0
-        ev_if_available = avg_value
-        ev_unconditional = total_value / num_simulations if num_simulations > 0 else 0.0
-        vor_now = player_vor(candidate, replacement_levels)
-        adp = float(candidate.adp)
-        adp_delta = (next_overall_pick - adp)
+    #                         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    #                         top_pool = [p for p, _ in ranked[:user_strategy_top_n] if sim_state.teams[user_team_idx].can_draft(p)]
+    #                         if top_pool:
+    #                             sim_state.make_pick(user_team_idx, random.choice(top_pool))
+    #                 sim_state.advance_pick()
+    #             else:
+    #                 opp_player = select_player_for_team(sim_state, team_idx, top_n=opponent_top_n)
+    #                 if opp_player:
+    #                     sim_state.make_pick(team_idx, opp_player)
+    #                 sim_state.advance_pick()
+    #         # After full draft (or break), evaluate if candidate was drafted
+    #         if forced_candidate:
+    #             value = evaluate_team_value(sim_state.teams[user_team_idx], starter_requirements)
+    #             total_value += value
+    #             successful_runs += 1
+    #     # Calculate expected value across simulations (averaging over all runs)
+    #     avg_value = (total_value / successful_runs) if successful_runs > 0 else 0.0
+    #     p_available = successful_runs / num_simulations if num_simulations > 0 else 0.0
+    #     ev_if_available = avg_value
+    #     ev_unconditional = total_value / num_simulations if num_simulations > 0 else 0.0
+    #     vor_now = player_vor(candidate, replacement_levels)
+    #     adp = float(candidate.adp)
+    #     adp_delta = (next_overall_pick - adp)
 
-        slots_now = draft_state.teams[user_team_idx].slots_remaining
-        pos = candidate.position.upper()
-        if slots_now.get(pos, 0) > 0:
-            fills_slot = f"{pos} starter"
-        elif pos in {"RB","WR","TE"} and slots_now.get("FLEX", 0) > 0:
-            fills_slot = "FLEX"
-        else:
-            fills_slot = "Bench"
+    #     slots_now = draft_state.teams[user_team_idx].slots_remaining
+    #     pos = candidate.position.upper()
+    #     if slots_now.get(pos, 0) > 0:
+    #         fills_slot = f"{pos} starter"
+    #     elif pos in {"RB","WR","TE"} and slots_now.get("FLEX", 0) > 0:
+    #         fills_slot = "FLEX"
+    #     else:
+    #         fills_slot = "Bench"
 
-        rationale = []
-        rationale.append(f"+{vor_now:.1f} VOR vs {pos} replacement")
-        rationale.append(f"{p_available*100:.0f}% chance available")
-        if adp_delta >= 1:
-            rationale.append(f"ADP value (+{adp_delta:.0f} picks)")
-        elif adp_delta <= -1:
-            rationale.append(f"Reach ({-adp_delta:.0f} picks)")
-        rationale.append(f"Fills {fills_slot}")
+    #     rationale = []
+    #     rationale.append(f"+{vor_now:.1f} VOR vs {pos} replacement")
+    #     rationale.append(f"{p_available*100:.0f}% chance available")
+    #     if adp_delta >= 1:
+    #         rationale.append(f"ADP value (+{adp_delta:.0f} picks)")
+    #     elif adp_delta <= -1:
+    #         rationale.append(f"Reach ({-adp_delta:.0f} picks)")
+    #     rationale.append(f"Fills {fills_slot}")
 
-        results.append(Recommendation(
-            player=candidate,
-            ev_if_available=ev_if_available,
-            p_available=p_available,
-            ev_unconditional=ev_unconditional,
-            vor=vor_now,
-            adp=adp,
-            adp_delta=adp_delta,
-            fills_slot=fills_slot,
-            rationale=rationale
-        ))
+    #     results.append(Recommendation(
+    #         player=candidate,
+    #         ev_if_available=ev_if_available,
+    #         p_available=p_available,
+    #         ev_unconditional=ev_unconditional,
+    #         vor=vor_now,
+    #         adp=adp,
+    #         adp_delta=adp_delta,
+    #         fills_slot=fills_slot,
+    #         rationale=rationale
+    #     ))
+    
+    #  prepare common arguments for parallel processing
+    common_kwargs = dict(
+        user_team_idx=user_team_idx,
+        starter_requirements=starter_requirements,
+        replacement_levels=replacement_levels,
+        user_strategy_weight_adp=user_strategy_weight_adp,
+        user_strategy_top_n=user_strategy_top_n,
+        opponent_top_n=opponent_top_n,
+        allow_flex_early=allow_flex_early,
+        flex_threshold=flex_threshold,
+        allow_bench_early=allow_bench_early,
+        bench_threshold=bench_threshold,
+    )
+    results: List[Recommendation] = []
+
+    with ProcessPoolExecutor(max_workers=SIM_WORKERS) as pool:
+        fut_map = {
+            pool.submit(
+                evaluate_candidate_batch,
+                draft_state,     # must be picklable; OK if your DraftState is pure-Python
+                candidate,
+                num_simulations=num_simulations,
+                **common_kwargs,
+            ): candidate
+            for candidate in candidate_players
+        }
+
+        for fut in as_completed(fut_map):
+            candidate = fut_map[fut]
+            part = fut.result()  # {"total_value": ..., "successful_runs": ..., "num_simulations": ...}
+
+            total_value = part["total_value"]
+            successful_runs = part["successful_runs"]
+
+            # compute per-candidate metrics (same math as before)
+            avg_value = (total_value / successful_runs) if successful_runs > 0 else 0.0
+            p_available = (successful_runs / num_simulations) if num_simulations > 0 else 0.0
+            ev_if_available = avg_value
+            ev_unconditional = (total_value / num_simulations) if num_simulations > 0 else 0.0
+            vor_now = player_vor(candidate, replacement_levels)
+            adp = float(candidate.adp)
+            adp_delta = (next_overall_pick - adp)
+
+            slots_now = draft_state.teams[user_team_idx].slots_remaining
+            pos = candidate.position.upper()
+            if slots_now.get(pos, 0) > 0:
+                fills_slot = f"{pos} starter"
+            elif pos in {"RB","WR","TE"} and slots_now.get("FLEX", 0) > 0:
+                fills_slot = "FLEX"
+            else:
+                fills_slot = "Bench"
+
+            rationale = []
+            rationale.append(f"+{vor_now:.1f} VOR vs {pos} replacement")
+            rationale.append(f"{p_available*100:.0f}% chance available")
+            if adp_delta >= 1:
+                rationale.append(f"ADP value (+{adp_delta:.0f} picks)")
+            elif adp_delta <= -1:
+                rationale.append(f"Reach ({-adp_delta:.0f} picks)")
+            rationale.append(f"Fills {fills_slot}")
+
+            results.append(Recommendation(
+                player=candidate,
+                ev_if_available=ev_if_available,
+                p_available=p_available,
+                ev_unconditional=ev_unconditional,
+                vor=vor_now,
+                adp=adp,
+                adp_delta=adp_delta,
+                fills_slot=fills_slot,
+                rationale=rationale
+            ))
     print("Simulation time:", time.time() - start)
     # Sort results by expected value descending
     results.sort(key=lambda r: (r.ev_unconditional, r.ev_if_available, r.vor), reverse=True)
