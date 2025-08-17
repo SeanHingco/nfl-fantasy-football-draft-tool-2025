@@ -1,8 +1,11 @@
 # server/app.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+import os, logging
 
 app = FastAPI(title="Fantasy Draft Recommender", version="0.1.0")
+logger = logging.getLogger("uvicorn.error")
+logger.info("CPU cores detected: %s", os.cpu_count())
 
 # allow your Vite dev server (default: http://localhost:5173)
 app.add_middleware(
